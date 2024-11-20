@@ -1,6 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from schemas import Event, EventBase
+from schemas import Event, EventBase, AdminConfig
 from memory import (
     add_event,
     events,
@@ -36,8 +36,8 @@ app.add_middleware(
 
 # Configurar parâmetros administrativos
 @app.post("/admin/config/")
-def configure_system(max_events: int, max_users: int, choice_time: int):
-    set_admin_config(max_events, max_users, choice_time)
+def configure_system(config: AdminConfig):
+    set_admin_config(config.max_events, config.max_users, config.choice_time)
     logging.info("Configuração administrativa atualizada.")
     return {"message": "Configuração atualizada com sucesso.", "config": admin_config}
 
