@@ -13,6 +13,11 @@ class ReservationBase(BaseModel):
     user_name: str
     user_phone: str
 
+class AdminConfig(BaseModel):
+    max_events: int
+    max_users: int
+    choice_time: int
+
 class Reservation(ReservationBase):
     id: int
     status: str

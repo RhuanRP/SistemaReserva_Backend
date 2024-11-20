@@ -1,6 +1,6 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from schemas import Event, EventBase
+from schemas import Event, EventBase, AdminConfig
 from memory import (
     add_event,
     events,
@@ -14,6 +14,7 @@ from memory import (
     check_timers,
     connection_last_activity,
     check_inactive_connections,
+    reservations,
 )
 import asyncio
 import logging
@@ -36,8 +37,8 @@ app.add_middleware(
 
 # Configurar parâmetros administrativos
 @app.post("/admin/config/")
-def configure_system(max_events: int, max_users: int, choice_time: int):
-    set_admin_config(max_events, max_users, choice_time)
+def configure_system(config: AdminConfig):
+    set_admin_config(config.max_events, config.max_users, config.choice_time)
     logging.info("Configuração administrativa atualizada.")
     return {"message": "Configuração atualizada com sucesso.", "config": admin_config}
 
@@ -62,10 +63,11 @@ def list_events():
 def get_users():
     logging.info("Solicitação de usuários online e fila.")
     return {
-        "online_users": online_users[:admin_config["max_users"]],  # Usuários ativos
-        "queue": online_users[admin_config["max_users"]:],  # Usuários na fila
+        "online_users": online_users[:admin_config["max_users"]],
+        "queue": online_users[admin_config["max_users"]:],
     }
 
+# Modelo para criar reservas temporárias
 class ReservationRequest(BaseModel):
     event_id: int
     user_id: str
@@ -89,16 +91,36 @@ async def create_reservation(reservation: ReservationRequest):
     logging.error(f"Reserva falhou: Evento {event_id} não encontrado.")
     raise HTTPException(status_code=404, detail="Evento não encontrado.")
 
+# Modelo para confirmar reservas
+class ConfirmReservationRequest(BaseModel):
+    event_id: int
+    user_id: str
+    name: str
+    phone: str
 
-# Função para serializar timers ativos
+@app.post("/confirm-reservation/")
+async def confirm_reservation(request: ConfirmReservationRequest):
+    user_id = request.user_id
+    event_id = request.event_id
+
+    logging.info(f"Tentativa de confirmação de reserva para {user_id} no evento {event_id}.")
+
+    if user_id not in active_timers or active_timers[user_id]["event_id"] != event_id:
+        logging.warning("Reserva temporária não encontrada ou expirada.")
+        raise HTTPException(status_code=400, detail="Reserva temporária não encontrada ou expirada.")
+
+    active_timers.pop(user_id, None)
+    reservations.append({"event_id": event_id, "user_id": user_id, "name": request.name, "phone": request.phone})
+
+    logging.info(f"Reserva confirmada com sucesso para {user_id} no evento {event_id}.")
+    return {"message": "Reserva confirmada com sucesso."}
+
+# Serializar timers ativos
 def serialize_timers(timers):
-    """
-    Converte os timers ativos para um formato serializável em JSON.
-    """
     return {
         user_id: {
             "event_id": timer["event_id"],
-            "expires_at": timer["expires_at"].isoformat()  # Converte datetime para string ISO 8601
+            "expires_at": timer["expires_at"].isoformat()
         }
         for user_id, timer in timers.items()
     }
@@ -119,10 +141,6 @@ class ConnectionManager:
             logging.info("Conexão WebSocket encerrada.")
 
     async def broadcast(self, message: dict):
-        """
-        Envia mensagens para todas as conexões ativas.
-        Serializa objetos datetime automaticamente para ISO 8601.
-        """
         invalid_connections = []
         for connection in self.active_connections:
             try:
@@ -137,7 +155,6 @@ class ConnectionManager:
 # Instância global do gerenciador de conexões
 manager = ConnectionManager()
 
-# WebSocket para comunicação em tempo real
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     user_id = websocket.query_params.get("user_id")
@@ -153,27 +170,19 @@ async def websocket_endpoint(websocket: WebSocket):
     try:
         while True:
             connection_last_activity[user_id] = datetime.now()
-
             check_timers()
-
             data = {
                 "events": events,
                 "online_users": online_users[:admin_config["max_users"]],
                 "queue": online_users[admin_config["max_users"]:],
                 "timers": serialize_timers(active_timers),
             }
-
             await manager.broadcast(data)
             await asyncio.sleep(1)
     except WebSocketDisconnect:
         logging.info(f"Usuário {user_id} desconectado.")
         manager.disconnect(websocket)
         remove_from_queue(user_id)
-    finally:
-        logging.info(f"Encerrando conexão com usuário {user_id}.")
-        manager.disconnect(websocket)
-        remove_from_queue(user_id)
-        await websocket.close(code=1000)
 
 @app.on_event("startup")
 async def startup_event():
