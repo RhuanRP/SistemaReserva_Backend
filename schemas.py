@@ -21,3 +21,8 @@ class AdminConfig(BaseModel):
 class Reservation(ReservationBase):
     id: int
     status: str
+
+class AdminConfig(BaseModel):
+    max_events: int
+    max_users: int
+    choice_time: int
