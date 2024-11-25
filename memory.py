@@ -134,10 +134,13 @@ def check_inactive_connections(timeout_seconds: int = 30):
     current_time = datetime.now()
     inactive_users = [
         user_id
-        for user_id, last_activity in connection_last_activity.items()
+        for user_id, last_activity in list(connection_last_activity.items())
         if (current_time - last_activity).total_seconds() > timeout_seconds
     ]
 
     for user_id in inactive_users:
         remove_from_queue(user_id)
+        connection_last_activity.pop(user_id, None)
+        if user_id in active_timers:
+            cancel_reservation(active_timers[user_id]["event_id"], user_id)
         logging.info(f"Usuário {user_id} removido por inatividade.")

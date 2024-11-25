@@ -157,24 +157,26 @@ manager = ConnectionManager()
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    user_id = websocket.query_params.get("user_id")
-    if not user_id:
-        logging.warning("Conexão WebSocket recusada: user_id ausente.")
-        await websocket.close(code=403)
-        return
-
+    user_id = f"user_{datetime.now().strftime('%H:%M:%S')}"
+    
     logging.info(f"Usuário {user_id} conectado via WebSocket.")
     add_to_queue(user_id)
     await manager.connect(websocket)
 
     try:
         while True:
+            # Tentar receber mensagem para detectar desconexão mais rapidamente
+            try:
+                await websocket.receive_text()
+            except WebSocketDisconnect:
+                raise
+            
             connection_last_activity[user_id] = datetime.now()
             check_timers()
             data = {
                 "events": events,
-                "online_users": online_users[:admin_config["max_users"]],
-                "queue": online_users[admin_config["max_users"]:],
+                "online_users": online_users,
+                "queue": online_users,
                 "timers": serialize_timers(active_timers),
             }
             await manager.broadcast(data)
@@ -183,6 +185,24 @@ async def websocket_endpoint(websocket: WebSocket):
         logging.info(f"Usuário {user_id} desconectado.")
         manager.disconnect(websocket)
         remove_from_queue(user_id)
+        # Limpar outras referências ao usuário
+        connection_last_activity.pop(user_id, None)
+        if user_id in active_timers:
+            cancel_reservation(active_timers[user_id]["event_id"], user_id)
+        
+        # Broadcast atualização após desconexão
+        data = {
+            "events": events,
+            "online_users": online_users,
+            "queue": online_users,
+            "timers": serialize_timers(active_timers),
+        }
+        await manager.broadcast(data)
+    except Exception as e:
+        logging.error(f"Erro na conexão WebSocket: {e}")
+        manager.disconnect(websocket)
+        remove_from_queue(user_id)
+        connection_last_activity.pop(user_id, None)
 
 @app.on_event("startup")
 async def startup_event():
