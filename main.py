@@ -164,6 +164,18 @@ async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
 
     try:
+        # Enviar dados imediatamente após a conexão
+        data = {
+            "events": events,
+            "online_users": online_users,
+            "queue": online_users,
+            "timers": serialize_timers(active_timers),
+        }
+        await websocket.send_json(data)  # Envia dados apenas para o novo usuário
+        
+        # Broadcast para todos os outros usuários
+        await manager.broadcast(data)
+
         while True:
             # Tentar receber mensagem para detectar desconexão mais rapidamente
             try:
