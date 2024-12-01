@@ -26,3 +26,9 @@ class AdminConfig(BaseModel):
     max_events: int
     max_users: int
     choice_time: int
+
+class ConfirmReservationRequest(BaseModel):
+    event_id: int
+    user_id: str
+    name: str
+    phone: str

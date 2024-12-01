@@ -1,5 +1,7 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
+from collections import deque
+from threading import Lock
 import logging
 
 # Simulação de banco de dados em memória
@@ -40,24 +42,83 @@ def get_event_by_id(event_id: int):
             return event
     return None
 
-def add_to_queue(user_id: str):
-    if user_id not in online_users:
-        online_users.append(user_id)
-    connection_last_activity[user_id] = datetime.now()  # Atualiza última atividade
+class QueueManager:
+    def __init__(self):
+        self.active_users = set()
+        self.waiting_queue = deque()
+        self.user_queue_times = {}
+        self.lock = Lock()
+        self.max_users = 3  # Valor padrão
+        self.queue_timeout = 30  # 30 segundos para interagir
+        
+    def add_user(self, user_id):
+        with self.lock:
+            self._clean_expired_users()
+            
+            if len(self.active_users) < self.max_users:
+                self.active_users.add(user_id)
+                self.user_queue_times[user_id] = datetime.now(UTC)
+                return True
+                
+            self.waiting_queue.append(user_id)
+            self.user_queue_times[user_id] = datetime.now(UTC)
+            return False
+            
+    def remove_user(self, user_id):
+        with self.lock:
+            if user_id in self.active_users:
+                self.active_users.remove(user_id)
+            if user_id in self.waiting_queue:
+                self.waiting_queue.remove(user_id)
+            self.user_queue_times.pop(user_id, None)
+            
+    def _clean_expired_users(self):
+        current_time = datetime.now(UTC)
+        expired_users = []
+        
+        # Verifica usuários ativos
+        for user_id in list(self.active_users):
+            queue_time = self.user_queue_times.get(user_id)
+            if queue_time:
+                elapsed_time = (current_time - queue_time).total_seconds()
+                if elapsed_time > self.queue_timeout:
+                    expired_users.append(user_id)
+                    
+        # Move usuários expirados para o final da fila
+        for user_id in expired_users:
+            self.active_users.remove(user_id)
+            self.waiting_queue.append(user_id)
+            self.user_queue_times[user_id] = current_time
+            
+        # Processa próximo usuário da fila
+        self._process_queue()
+        
+        return expired_users
+        
+    def _process_queue(self):
+        if self.waiting_queue and len(self.active_users) < self.max_users:
+            next_user = self.waiting_queue.popleft()
+            self.active_users.add(next_user)
+            self.user_queue_times[next_user] = datetime.now(UTC)
+            return next_user
+        return None
+        
+    def get_queue_position(self, user_id):
+        try:
+            return list(self.waiting_queue).index(user_id) + 1
+        except ValueError:
+            return None
+            
+    def get_remaining_time(self, user_id):
+        queue_time = self.user_queue_times.get(user_id)
+        if not queue_time:
+            return None
+        
+        elapsed = (datetime.now(UTC) - queue_time).total_seconds()
+        remaining = max(0, self.queue_timeout - elapsed)
+        return int(remaining)
 
-def remove_from_queue(user_id: str):
-    if user_id in online_users:
-        online_users.remove(user_id)
-        logging.info(f"Usuário {user_id} removido da lista. Usuários online: {online_users}")
-    connection_last_activity.pop(user_id, None)  # Remove do rastreamento de atividade
-
-def get_current_queue():
-    # Retorna usuários fora do limite de interação simultânea
-    return online_users[admin_config["max_users"]:]
-
-def get_active_users():
-    # Retorna os usuários atualmente interagindo com os cards
-    return online_users[:admin_config["max_users"]]
+queue_manager = QueueManager()
 
 # Gerenciamento de reservas temporárias
 async def reserve_with_timeout(event_id: int, user_id: str, timeout: int):
@@ -126,10 +187,10 @@ def check_timers():
         active_timers.pop(user_id, None)
         reservation_timeouts.pop(user_id, None)
 
-# Função para verificar conexões inativas
 def check_inactive_connections(timeout_seconds: int = 30):
     """
     Verifica e remove usuários inativos com base no tempo limite.
+    Move usuários inativos para o final da fila.
     """
     current_time = datetime.now()
     inactive_users = [
@@ -139,8 +200,89 @@ def check_inactive_connections(timeout_seconds: int = 30):
     ]
 
     for user_id in inactive_users:
-        remove_from_queue(user_id)
-        connection_last_activity.pop(user_id, None)
-        if user_id in active_timers:
-            cancel_reservation(active_timers[user_id]["event_id"], user_id)
-        logging.info(f"Usuário {user_id} removido por inatividade.")
+        if user_id in online_users[:admin_config["max_users"]]:
+            # Remove o usuário da lista
+            online_users.remove(user_id)
+            # Adiciona ao final da fila
+            online_users.append(user_id)
+            logging.info(f"Usuário {user_id} movido para o final da fila por inatividade.")
+            
+            # Cancela qualquer reserva temporária que o usuário possa ter
+            if user_id in active_timers:
+                cancel_reservation(active_timers[user_id]["event_id"], user_id)
+            
+            # Atualiza o timestamp para o momento atual
+            connection_last_activity[user_id] = current_time
+
+def confirm_reservation(event_id: int, user_id: str):
+    """
+    Confirma uma reserva temporária, tornando-a permanente.
+    Retorna:
+        dict: Mensagem de sucesso ou erro
+    """
+    # Verifica se existe uma reserva temporária ativa
+    if user_id not in reservation_timeouts:
+        return {"error": "Não há reserva temporária ativa para este usuário."}
+
+    event = get_event_by_id(event_id)
+    if not event:
+        return {"error": "Evento não encontrado."}
+
+    # Verifica se o evento da reserva temporária corresponde ao evento sendo confirmado
+    if active_timers[user_id]["event_id"] != event_id:
+        return {"error": "O evento não corresponde à reserva temporária."}
+
+    # Cancela o timer de timeout
+    reservation_timeouts[user_id].cancel()
+    reservation_timeouts.pop(user_id)
+    active_timers.pop(user_id)
+
+    # Adiciona à lista de reservas confirmadas
+    reservation = {
+        "event_id": event_id,
+        "user_id": user_id,
+        "confirmed_at": datetime.now()
+    }
+    reservations.append(reservation)
+
+    return {"message": "Reserva confirmada com sucesso."}
+
+def initialize_default_events():
+    """
+    Inicializa o sistema com eventos padrão
+    """
+    events.clear()  # Limpa eventos existentes
+    
+    default_events = [
+        {"name": "DevFest", "total_slots": 100},
+        {"name": "Campus Party", "total_slots": 1000},
+        {"name": "Jogo Palmeiras", "total_slots": 40000},
+        {"name": "Palestra", "total_slots": 50},
+    ]
+    
+    for event_data in default_events:
+        add_event(event_data["name"], event_data["total_slots"])
+
+def get_remaining_time(user_id: str) -> int:
+    """
+    Calcula o tempo restante para um usuário baseado em sua última atividade.
+    Retorna o tempo em segundos.
+    """
+    if user_id not in connection_last_activity:
+        return 30
+        
+    elapsed_time = (datetime.now() - connection_last_activity[user_id]).total_seconds()
+    remaining_time = max(0, 30 - int(elapsed_time))
+    return remaining_time
+
+def serialize_timers(timers):
+    """
+    Serializa os timers ativos para envio via WebSocket
+    """
+    return {
+        user_id: {
+            "event_id": timer["event_id"],
+            "expires_at": timer["expires_at"].isoformat()
+        }
+        for user_id, timer in timers.items()
+    }

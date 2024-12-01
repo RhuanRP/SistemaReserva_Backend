@@ -2,19 +2,18 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from schemas import Event, EventBase, AdminConfig
 from memory import (
+    queue_manager,
     add_event,
     events,
     set_admin_config,
     admin_config,
-    online_users,
-    add_to_queue,
-    remove_from_queue,
     reserve_with_timeout,
     active_timers,
     check_timers,
-    connection_last_activity,
-    check_inactive_connections,
     reservations,
+    confirm_reservation,
+    initialize_default_events,
+    serialize_timers,
 )
 import asyncio
 import logging
@@ -99,18 +98,24 @@ class ConfirmReservationRequest(BaseModel):
     phone: str
 
 @app.post("/confirm-reservation/")
-async def confirm_reservation(request: ConfirmReservationRequest):
+async def confirm_reservation_endpoint(request: ConfirmReservationRequest):
     user_id = request.user_id
     event_id = request.event_id
 
     logging.info(f"Tentativa de confirmação de reserva para {user_id} no evento {event_id}.")
 
-    if user_id not in active_timers or active_timers[user_id]["event_id"] != event_id:
-        logging.warning("Reserva temporária não encontrada ou expirada.")
-        raise HTTPException(status_code=400, detail="Reserva temporária não encontrada ou expirada.")
+    # Usar a função confirm_reservation do memory.py
+    result = confirm_reservation(event_id, user_id)
+    if "error" in result:
+        logging.warning(f"Erro na confirmação: {result['error']}")
+        raise HTTPException(status_code=400, detail=result["error"])
 
-    active_timers.pop(user_id, None)
-    reservations.append({"event_id": event_id, "user_id": user_id, "name": request.name, "phone": request.phone})
+    # Adicionar informações adicionais à reserva
+    for reservation in reservations:
+        if reservation["user_id"] == user_id and reservation["event_id"] == event_id:
+            reservation["name"] = request.name
+            reservation["phone"] = request.phone
+            break
 
     logging.info(f"Reserva confirmada com sucesso para {user_id} no evento {event_id}.")
     return {"message": "Reserva confirmada com sucesso."}
@@ -156,68 +161,78 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    user_id = f"user_{datetime.now().strftime('%H:%M:%S')}"
+async def websocket_endpoint(websocket: WebSocket, user_id: str = None):
+    if not user_id:
+        user_id = f"user_{datetime.now().strftime('%H:%M:%S')}"
     
     logging.info(f"Usuário {user_id} conectado via WebSocket.")
-    add_to_queue(user_id)
-    await manager.connect(websocket)
+    
+    # Aceitar a conexão WebSocket
+    await websocket.accept()
+    
+    # Adicionar usuário à fila e verificar se está ativo
+    is_active = queue_manager.add_user(user_id)
+    
+    # Enviar estado inicial
+    initial_data = {
+        "events": events,
+        "online_users": list(queue_manager.active_users),
+        "queue": list(queue_manager.waiting_queue),
+        "timers": serialize_timers(active_timers),
+        "user_status": "active" if is_active else f"queue_{queue_manager.get_queue_position(user_id)}",
+        "interaction_timeout": queue_manager.get_remaining_time(user_id)
+    }
+    await websocket.send_json(initial_data)
 
     try:
-        # Enviar dados imediatamente após a conexão
-        data = {
-            "events": events,
-            "online_users": online_users,
-            "queue": online_users,
-            "timers": serialize_timers(active_timers),
-        }
-        await websocket.send_json(data)  # Envia dados apenas para o novo usuário
-        
-        # Broadcast para todos os outros usuários
-        await manager.broadcast(data)
-
         while True:
-            # Tentar receber mensagem para detectar desconexão mais rapidamente
             try:
+                # Aguardar mensagem do cliente
                 await websocket.receive_text()
+                
+                # Verificar usuários expirados e processar fila
+                expired_users = queue_manager._clean_expired_users()
+                
+                # Preparar dados atualizados
+                data = {
+                    "events": events,
+                    "online_users": list(queue_manager.active_users),
+                    "queue": list(queue_manager.waiting_queue),
+                    "timers": serialize_timers(active_timers),
+                    "user_status": "active" if user_id in queue_manager.active_users else f"queue_{queue_manager.get_queue_position(user_id)}",
+                    "interaction_timeout": queue_manager.get_remaining_time(user_id)
+                }
+                
+                # Enviar atualizações
+                await websocket.send_json(data)
+                
             except WebSocketDisconnect:
                 raise
             
-            connection_last_activity[user_id] = datetime.now()
-            check_timers()
-            data = {
-                "events": events,
-                "online_users": online_users,
-                "queue": online_users,
-                "timers": serialize_timers(active_timers),
-            }
-            await manager.broadcast(data)
             await asyncio.sleep(1)
+            
     except WebSocketDisconnect:
         logging.info(f"Usuário {user_id} desconectado.")
-        manager.disconnect(websocket)
-        remove_from_queue(user_id)
-        # Limpar outras referências ao usuário
-        connection_last_activity.pop(user_id, None)
-        if user_id in active_timers:
-            cancel_reservation(active_timers[user_id]["event_id"], user_id)
+        queue_manager.remove_user(user_id)
         
-        # Broadcast atualização após desconexão
-        data = {
+        # Notificar outros usuários da desconexão
+        broadcast_data = {
             "events": events,
-            "online_users": online_users,
-            "queue": online_users,
-            "timers": serialize_timers(active_timers),
+            "online_users": list(queue_manager.active_users),
+            "queue": list(queue_manager.waiting_queue),
+            "timers": serialize_timers(active_timers)
         }
-        await manager.broadcast(data)
-    except Exception as e:
-        logging.error(f"Erro na conexão WebSocket: {e}")
-        manager.disconnect(websocket)
-        remove_from_queue(user_id)
-        connection_last_activity.pop(user_id, None)
+        
+        # Broadcast para outros usuários
+        for connection in manager.active_connections:
+            if connection != websocket:
+                await connection.send_json(broadcast_data)
 
 @app.on_event("startup")
 async def startup_event():
+    # Inicializa eventos padrão
+    initialize_default_events()
+    
     async def monitor_inactive_connections():
         while True:
             check_inactive_connections(timeout_seconds=30)
