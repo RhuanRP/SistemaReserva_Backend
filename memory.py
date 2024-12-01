@@ -1,8 +1,10 @@
 import asyncio
 from datetime import datetime, timedelta, UTC
 from collections import deque
-from threading import Lock
+from threading import Lock, Semaphore, Thread, RLock
 import logging
+import threading
+import time
 
 # Simulação de banco de dados em memória
 events = []
@@ -16,6 +18,11 @@ admin_config = {
 }
 active_timers = {}  # Armazena timers ativos com horários de expiração
 connection_last_activity = {}  # Rastreia a última atividade de cada usuário
+
+# Adicionar após as variáveis globais
+event_locks = {}  # Lock por evento
+global_lock = threading.RLock()  # Lock recursivo global
+reservation_semaphore = Semaphore(10)  # Limita reservas simultâneas
 
 # Funções utilitárias para administração
 def set_admin_config(max_events: int, max_users: int, choice_time: int):
@@ -47,9 +54,9 @@ class QueueManager:
         self.active_users = set()
         self.waiting_queue = deque()
         self.user_queue_times = {}
-        self.lock = Lock()
-        self.max_users = 3  # Valor padrão
-        self.queue_timeout = 30  # 30 segundos para interagir
+        self.lock = threading.RLock()
+        self.max_users = 3
+        self.queue_timeout = 30
         
     def add_user(self, user_id):
         with self.lock:
@@ -60,18 +67,19 @@ class QueueManager:
                 self.user_queue_times[user_id] = datetime.now(UTC)
                 return True
                 
-            self.waiting_queue.append(user_id)
-            self.user_queue_times[user_id] = datetime.now(UTC)
+            if user_id not in self.waiting_queue:
+                self.waiting_queue.append(user_id)
+                self.user_queue_times[user_id] = datetime.now(UTC)
             return False
-            
+
     def remove_user(self, user_id):
         with self.lock:
-            if user_id in self.active_users:
-                self.active_users.remove(user_id)
+            self.active_users.discard(user_id)
             if user_id in self.waiting_queue:
                 self.waiting_queue.remove(user_id)
             self.user_queue_times.pop(user_id, None)
-            
+            self._process_queue()
+
     def _clean_expired_users(self):
         current_time = datetime.now(UTC)
         expired_users = []
@@ -122,22 +130,32 @@ queue_manager = QueueManager()
 
 # Gerenciamento de reservas temporárias
 async def reserve_with_timeout(event_id: int, user_id: str, timeout: int):
-    """
-    Cria uma reserva temporária com timeout.
-    """
-    if user_id in reservation_timeouts:
-        return {"error": "Usuário já tem uma reserva ativa."}
+    """Cria uma reserva temporária com timeout."""
+    try:
+        if not reservation_semaphore.acquire(timeout=1):  # timeout de 1 segundo para evitar bloqueio
+            return {"error": "Sistema ocupado, tente novamente."}
+            
+        with global_lock:
+            if user_id in reservation_timeouts:
+                return {"error": "Usuário já tem uma reserva ativa."}
 
-    expiration_time = datetime.now() + timedelta(seconds=timeout)
-    active_timers[user_id] = {
-        "event_id": event_id,
-        "expires_at": expiration_time
-    }
+            event = get_event_by_id(event_id)
+            if not event or event["available_slots"] <= 0:
+                return {"error": "Não há vagas disponíveis."}
 
-    reservation_timeouts[user_id] = asyncio.create_task(
-        timeout_reservation(event_id, user_id, timeout)
-    )
-    return {"message": "Reserva temporária criada com sucesso."}
+            expiration_time = datetime.now() + timedelta(seconds=timeout)
+            active_timers[user_id] = {
+                "event_id": event_id,
+                "expires_at": expiration_time
+            }
+
+            reservation_timeouts[user_id] = asyncio.create_task(
+                timeout_reservation(event_id, user_id, timeout)
+            )
+            
+            return {"message": "Reserva temporária criada com sucesso."}
+    finally:
+        reservation_semaphore.release()
 
 async def timeout_reservation(event_id: int, user_id: str, timeout: int):
     """
@@ -215,37 +233,32 @@ def check_inactive_connections(timeout_seconds: int = 30):
             connection_last_activity[user_id] = current_time
 
 def confirm_reservation(event_id: int, user_id: str):
-    """
-    Confirma uma reserva temporária, tornando-a permanente.
-    Retorna:
-        dict: Mensagem de sucesso ou erro
-    """
-    # Verifica se existe uma reserva temporária ativa
-    if user_id not in reservation_timeouts:
-        return {"error": "Não há reserva temporária ativa para este usuário."}
+    """Confirma uma reserva temporária."""
+    with global_lock:
+        if user_id not in reservation_timeouts:
+            return {"error": "Não há reserva temporária ativa para este usuário."}
 
-    event = get_event_by_id(event_id)
-    if not event:
-        return {"error": "Evento não encontrado."}
+        event = get_event_by_id(event_id)
+        if not event:
+            return {"error": "Evento não encontrado."}
 
-    # Verifica se o evento da reserva temporária corresponde ao evento sendo confirmado
-    if active_timers[user_id]["event_id"] != event_id:
-        return {"error": "O evento não corresponde à reserva temporária."}
+        if active_timers[user_id]["event_id"] != event_id:
+            return {"error": "O evento não corresponde à reserva temporária."}
 
-    # Cancela o timer de timeout
-    reservation_timeouts[user_id].cancel()
-    reservation_timeouts.pop(user_id)
-    active_timers.pop(user_id)
+        # Cancela o timer de timeout
+        reservation_timeouts[user_id].cancel()
+        reservation_timeouts.pop(user_id)
+        active_timers.pop(user_id)
 
-    # Adiciona à lista de reservas confirmadas
-    reservation = {
-        "event_id": event_id,
-        "user_id": user_id,
-        "confirmed_at": datetime.now()
-    }
-    reservations.append(reservation)
+        # Adiciona à lista de reservas confirmadas
+        reservation = {
+            "event_id": event_id,
+            "user_id": user_id,
+            "confirmed_at": datetime.now()
+        }
+        reservations.append(reservation)
 
-    return {"message": "Reserva confirmada com sucesso."}
+        return {"message": "Reserva confirmada com sucesso."}
 
 def initialize_default_events():
     """
@@ -286,3 +299,34 @@ def serialize_timers(timers):
         }
         for user_id, timer in timers.items()
     }
+
+def get_event_lock(event_id):
+    """Obtém ou cria um lock para um evento específico"""
+    with global_lock:
+        if event_id not in event_locks:
+            event_locks[event_id] = Lock()
+        return event_locks[event_id]
+
+class ResourceMonitor(Thread):
+    def __init__(self, interval=5):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self._stop_event = threading.Event()
+
+    def run(self):
+        while not self._stop_event.is_set():
+            try:
+                with global_lock:
+                    check_timers()
+                    check_inactive_connections()
+            except Exception as e:
+                logging.error(f"Erro no monitor de recursos: {e}")
+            time.sleep(self.interval)
+
+    def stop(self):
+        self._stop_event.set()
+
+# Inicializar o monitor de recursos apenas se ainda não estiver rodando
+if not any(isinstance(t, ResourceMonitor) for t in threading.enumerate()):
+    resource_monitor = ResourceMonitor()
+    resource_monitor.start()
